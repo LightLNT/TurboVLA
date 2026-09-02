@@ -46,3 +46,6 @@ tmp/
 # Browser QA artifacts.
 .playwright-cli/
 **/.playwright-cli/
+
+# made by myself
+pretrained*
