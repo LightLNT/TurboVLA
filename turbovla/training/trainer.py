@@ -15,7 +15,9 @@ from tqdm import tqdm
 
 from ..data.libero_rlds import (
     LiberoRLDSDataset,
+    LiberoSequenceRLDSDataset,
     vla_collate_fn,
+    vla_sequence_collate_fn,
 )
 from ..models.turbovla import (
     build_turbovla,
@@ -49,6 +51,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-10)
     parser.add_argument("--head_lr", type=float, default=5e-5)
+    parser.add_argument("--ttt_outer_lr", type=float, default=5e-5)
     parser.add_argument("--dinov3_lr", type=float, default=5e-5)
     parser.add_argument("--head_weight_decay", type=float, default=1e-10)
     parser.add_argument("--dinov3_weight_decay", type=float, default=1e-10)
@@ -74,6 +77,11 @@ def parse_args():
     parser.add_argument("--shuffle_buffer", type=int, default=512)
     parser.add_argument("--step_mix_buffer_size", type=int, default=64)
     parser.add_argument("--expected_image_size", type=int, default=256)
+    parser.set_defaults(sequence_training=False)
+    parser.add_argument("--sequence_training", dest="sequence_training", action="store_true")
+    parser.add_argument("--no_sequence_training", dest="sequence_training", action="store_false")
+    parser.add_argument("--context_length", type=int, default=8)
+    parser.add_argument("--temporal_stride", type=int, default=12)
 
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--nheads", type=int, default=8)
@@ -117,6 +125,26 @@ def parse_args():
     parser.set_defaults(freeze_text_encoder=True)
     parser.add_argument("--freeze_text_encoder", dest="freeze_text_encoder", action="store_true")
     parser.add_argument("--train_text_encoder", dest="freeze_text_encoder", action="store_false")
+
+    parser.set_defaults(freeze_text_projection=False)
+    parser.add_argument("--freeze_text_projection", dest="freeze_text_projection", action="store_true")
+    parser.add_argument("--train_text_projection", dest="freeze_text_projection", action="store_false")
+
+    parser.set_defaults(freeze_vision_projection=False)
+    parser.add_argument("--freeze_vision_projection", dest="freeze_vision_projection", action="store_true")
+    parser.add_argument("--train_vision_projection", dest="freeze_vision_projection", action="store_false")
+
+    parser.set_defaults(freeze_vl_interaction=False)
+    parser.add_argument("--freeze_vl_interaction", dest="freeze_vl_interaction", action="store_true")
+    parser.add_argument("--train_vl_interaction", dest="freeze_vl_interaction", action="store_false")
+
+    parser.set_defaults(enable_ttt=False)
+    parser.add_argument("--enable_ttt", dest="enable_ttt", action="store_true")
+    parser.add_argument("--no_enable_ttt", dest="enable_ttt", action="store_false")
+    parser.add_argument("--ttt_position", type=str, default="post_vl_fusion")
+    parser.add_argument("--ttt_inner_lr_init", type=float, default=1e-2)
+    parser.add_argument("--ttt_gate_init", type=float, default=1e-4)
+    parser.add_argument("--tbptt_step_size", type=int, default=None)
 
     parser.set_defaults(require_feature_enhancer_preload=True)
     parser.add_argument(
@@ -223,6 +251,11 @@ def build_model_architecture(args):
     model_args.position_embedding = "view"
     model_args.encode_views_separately = True
     model_args.padding_strategy = "key_padding_mask"
+    model_args.enable_ttt = args.enable_ttt
+    model_args.ttt_position = args.ttt_position
+    model_args.ttt_inner_lr_init = args.ttt_inner_lr_init
+    model_args.ttt_gate_init = args.ttt_gate_init
+    model_args.tbptt_step_size = args.tbptt_step_size
     return build_turbovla(model_args)
 
 
@@ -230,6 +263,15 @@ def freeze_backbones(model):
     for name, param in model.named_parameters():
         if name.startswith("vision_encoder.backbone"):
             param.requires_grad = False
+
+
+def apply_requested_freezes(model, args):
+    if args.freeze_text_projection:
+        model.text_encoder.text_projection.requires_grad_(False)
+    if args.freeze_vision_projection:
+        model.vision_projection.requires_grad_(False)
+    if args.freeze_vl_interaction:
+        model.vision_language_interaction.requires_grad_(False)
 
 
 def get_latest_checkpoint(ckpt_dir, prefix):
@@ -286,6 +328,8 @@ def build_param_group_optimizer(model, args):
     grouped = {
         ("dinov3_decay", args.dinov3_lr, args.dinov3_weight_decay): [],
         ("dinov3_no_decay", args.dinov3_lr, 0.0): [],
+        ("ttt_decay", args.ttt_outer_lr, head_wd): [],
+        ("ttt_no_decay", args.ttt_outer_lr, 0.0): [],
         ("head_decay", head_lr, head_wd): [],
         ("head_no_decay", head_lr, 0.0): [],
     }
@@ -293,11 +337,16 @@ def build_param_group_optimizer(model, args):
         if not param.requires_grad:
             continue
         is_dino = name.startswith("vision_encoder.backbone")
+        is_ttt = name.startswith("ttt.")
         decay = _use_weight_decay(name, param)
         if is_dino and decay:
             key = ("dinov3_decay", args.dinov3_lr, args.dinov3_weight_decay)
         elif is_dino:
             key = ("dinov3_no_decay", args.dinov3_lr, 0.0)
+        elif is_ttt and decay:
+            key = ("ttt_decay", args.ttt_outer_lr, head_wd)
+        elif is_ttt:
+            key = ("ttt_no_decay", args.ttt_outer_lr, 0.0)
         elif decay:
             key = ("head_decay", head_lr, head_wd)
         else:
@@ -325,6 +374,22 @@ def reduce_mean(value, device, is_distributed, world_size):
 
 def unwrap_model(model):
     return model.module if isinstance(model, DDP) else model
+
+
+def flatten_sequence_batch(pred_actions, gt_actions, action_chunk_masks):
+    if pred_actions.ndim == 4:
+        batch_size, time = pred_actions.shape[:2]
+        pred_actions = pred_actions.reshape(batch_size * time, *pred_actions.shape[2:])
+        gt_actions = gt_actions.reshape(batch_size * time, *gt_actions.shape[2:])
+        action_chunk_masks = action_chunk_masks.reshape(batch_size * time, *action_chunk_masks.shape[2:])
+    return pred_actions, gt_actions, action_chunk_masks
+
+
+def ttt_log_stats(model):
+    module = unwrap_model(model)
+    if getattr(module, "ttt", None) is None:
+        return {}
+    return module.ttt.last_stats()
 
 
 def _extract_state_dict(ckpt_obj):
@@ -511,6 +576,7 @@ def train_model():
 
         if args.freeze_backbones:
             freeze_backbones(model)
+        apply_requested_freezes(model, args)
 
         if rank == 0:
             trainable = [n for n, p in model.named_parameters() if p.requires_grad]
@@ -527,7 +593,17 @@ def train_model():
             print(f"max_steps={args.max_steps}, lr_schedule_steps={args.lr_schedule_steps}")
             print(
                 f"precision={args.precision}, head_lr={args.head_lr}, dinov3_lr={args.dinov3_lr}, "
-                f"head_wd={args.head_weight_decay}, dinov3_wd={args.dinov3_weight_decay}"
+                f"ttt_outer_lr={args.ttt_outer_lr}, head_wd={args.head_weight_decay}, "
+                f"dinov3_wd={args.dinov3_weight_decay}"
+            )
+            print(
+                f"enable_ttt={args.enable_ttt}, sequence_training={args.sequence_training}, "
+                f"context_length={args.context_length}, temporal_stride={args.temporal_stride}, "
+                f"ttt_inner_lr_init={args.ttt_inner_lr_init}"
+            )
+            print(
+                f"freezes: backbones={args.freeze_backbones}, text_projection={args.freeze_text_projection}, "
+                f"vision_projection={args.freeze_vision_projection}, vl_interaction={args.freeze_vl_interaction}"
             )
             print(f"warmup_steps={args.warmup_steps}, min_lr_ratio={args.min_lr_ratio}")
             print(
@@ -554,6 +630,10 @@ def train_model():
             if rank == 0:
                 print("resume missing keys:", len(missing))
                 print("resume unexpected keys:", len(unexpected))
+                if missing:
+                    print("resume missing key names:", missing)
+                if unexpected:
+                    print("resume unexpected key names:", unexpected)
             if args.resume_mode == "all":
                 global_step = int(ckpt.get("global_step", 0))
             else:
@@ -587,7 +667,16 @@ def train_model():
 
         model_to_load = unwrap_model(model)
 
-        dataset = LiberoRLDSDataset(
+        dataset_cls = LiberoSequenceRLDSDataset if args.sequence_training else LiberoRLDSDataset
+        dataset_kwargs = {}
+        if args.sequence_training:
+            dataset_kwargs.update(
+                {
+                    "context_length": args.context_length,
+                    "temporal_stride": args.temporal_stride,
+                }
+            )
+        dataset = dataset_cls(
             dataset_dir=args.dataset_dir,
             LOCAL_DINOV3_PATH=args.dinov3_path,
             rank=rank,
@@ -600,13 +689,14 @@ def train_model():
             seed=args.seed,
             local_files_only=not args.allow_hf_download,
             expected_image_size=args.expected_image_size,
+            **dataset_kwargs,
         )
 
         dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
             sampler=None,
-            collate_fn=vla_collate_fn,
+            collate_fn=vla_sequence_collate_fn if args.sequence_training else vla_collate_fn,
             num_workers=args.num_workers,
             pin_memory=(device.type == "cuda"),
             persistent_workers=(args.num_workers > 0),
@@ -655,6 +745,11 @@ def train_model():
                             f"pred_actions.shape={pred_actions.shape}, gt_actions.shape={gt_actions.shape} mismatch"
                         )
 
+                    pred_actions, gt_actions, action_chunk_masks = flatten_sequence_batch(
+                        pred_actions,
+                        gt_actions,
+                        action_chunk_masks,
+                    )
                     loss = masked_l1_loss(pred_actions, gt_actions, action_chunk_masks)
                 (loss / args.grad_accum_steps).backward()
                 loss_accum += loss.detach().item()
@@ -676,13 +771,21 @@ def train_model():
                 avg_window_loss = sum(loss_window) / len(loss_window)
                 pbar.update(1)
                 if global_step % args.log_freq == 0:
-                    pbar.set_postfix(
-                        {
-                            "loss": f"{global_loss:.5f}",
-                            "avg": f"{avg_window_loss:.5f}",
-                            "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-                        }
-                    )
+                    postfix = {
+                        "loss": f"{global_loss:.5f}",
+                        "avg": f"{avg_window_loss:.5f}",
+                        "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                    }
+                    stats = ttt_log_stats(model)
+                    if stats:
+                        postfix.update(
+                            {
+                                "ttt_lr": f"{stats['actual_ttt_lr']:.2e}",
+                                "ttt_gate": f"{stats['ttt_gate_abs']:.2e}",
+                                "dW/W": f"{stats['relative_update_norm']:.2e}",
+                            }
+                        )
+                    pbar.set_postfix(postfix)
 
             should_save = global_step % args.save_steps == 0 or (
                 args.save_final and global_step == args.max_steps

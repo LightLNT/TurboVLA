@@ -9,6 +9,7 @@ import sys
 from . import pi05, trainer
 from ..data.mixed_suite import (
     LiberoMixedRLDSDataset,
+    LiberoMixedSequenceRLDSDataset,
 )
 
 
@@ -59,6 +60,19 @@ class MixedSuiteStatsLiberoRLDSDataset(LiberoMixedRLDSDataset):
         )
 
 
+class MixedSuiteStatsLiberoSequenceRLDSDataset(LiberoMixedSequenceRLDSDataset):
+    def __init__(self, *args, **kwargs):
+        active_args = trainer._ACTIVE_TRAIN_ARGS
+        super().__init__(
+            *args,
+            dataset_dirs=active_args.dataset_dirs,
+            stats_path=active_args.stats_path,
+            stats_key=active_args.stats_key,
+            normalize_binary_gripper=active_args.normalize_binary_gripper,
+            **kwargs,
+        )
+
+
 trainer._ACTIVE_TRAIN_ARGS = None
 
 
@@ -70,6 +84,7 @@ def parse_args_and_record():
 
 trainer.parse_args = parse_args_and_record
 trainer.LiberoRLDSDataset = MixedSuiteStatsLiberoRLDSDataset
+trainer.LiberoSequenceRLDSDataset = MixedSuiteStatsLiberoSequenceRLDSDataset
 
 
 def main():

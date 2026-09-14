@@ -284,6 +284,9 @@ def _make_model_args(
     fusion_dropout: float,
     fusion_droppath: float,
     sub_sentence_present: bool,
+    enable_ttt: bool,
+    ttt_inner_lr_init: float,
+    ttt_gate_init: float,
     text_padding_length: int,
     precision: str,
     allow_hf_download: bool,
@@ -315,6 +318,11 @@ def _make_model_args(
         position_embedding="view",
         encode_views_separately=True,
         padding_strategy="key_padding_mask",
+        enable_ttt=enable_ttt,
+        ttt_position="post_vl_fusion",
+        ttt_inner_lr_init=ttt_inner_lr_init,
+        ttt_gate_init=ttt_gate_init,
+        tbptt_step_size=None,
     )
 
 
@@ -347,6 +355,9 @@ class TurboVLAPolicy:
         fusion_dropout: float = 0.0,
         fusion_droppath: float = 0.1,
         sub_sentence_present: bool = True,
+        enable_ttt: bool = False,
+        ttt_inner_lr_init: float = 1e-2,
+        ttt_gate_init: float = 1e-4,
         precision: str = "bf16",
         dinov3_output_hidden_states: bool = True,
         verbose: bool = True,
@@ -417,6 +428,9 @@ class TurboVLAPolicy:
                 fusion_dropout=fusion_dropout,
                 fusion_droppath=fusion_droppath,
                 sub_sentence_present=sub_sentence_present,
+                enable_ttt=enable_ttt,
+                ttt_inner_lr_init=ttt_inner_lr_init,
+                ttt_gate_init=ttt_gate_init,
                 precision=self.precision,
                 allow_hf_download=allow_hf_download,
             )
@@ -426,6 +440,7 @@ class TurboVLAPolicy:
         self.model.to(self.device)
         self.model.eval()
         self.model.requires_grad_(False)
+        self.ttt_memory = None
         self._verify_model_precision()
         self.dinov3_processor = build_dinov3_manual_processor(self.dinov3_path)
 
@@ -458,13 +473,25 @@ class TurboVLAPolicy:
 
     def _load_checkpoint(self) -> None:
         source_state = _strip_module_prefix(_checkpoint_state_dict(self._checkpoint))
-        self.model.load_state_dict(source_state, strict=True)
+        strict = not bool(getattr(self.model.config.ttt, "enable_ttt", False))
+        missing, unexpected = self.model.load_state_dict(source_state, strict=strict)
         if self.verbose:
+            load_mode = "strict" if strict else "non-strict"
             print(
-                f"[TurboVLAPolicy] strict checkpoint load: {self.ckpt_path} ({len(source_state)} tensors)",
+                f"[TurboVLAPolicy] {load_mode} checkpoint load: {self.ckpt_path} ({len(source_state)} tensors)",
                 flush=True,
             )
+            if missing:
+                print(f"[TurboVLAPolicy] missing keys: {missing}", flush=True)
+            if unexpected:
+                print(f"[TurboVLAPolicy] unexpected keys: {unexpected}", flush=True)
         del self._checkpoint
+
+    def reset_ttt_memory(self) -> None:
+        self.ttt_memory = None
+
+    def reset(self) -> None:
+        self.reset_ttt_memory()
 
     def _build_batch(
         self,
@@ -509,8 +536,19 @@ class TurboVLAPolicy:
 
         samples, states = self._build_batch([primary_image], [wrist_image], [state])
         samples, states = self._prepare_model_inputs(samples, states)
-        with torch.inference_mode():
-            pred = self.model([instruction], samples, states)
+        if getattr(self.model.config.ttt, "enable_ttt", False):
+            # TTT inference still computes grad_W L_FW for the trajectory-specific
+            # fast weights, so torch.inference_mode() would disable the update.
+            with torch.enable_grad():
+                pred, self.ttt_memory = self.model.forward_step(
+                    [instruction],
+                    samples,
+                    states,
+                    prev_ttt_memory=self.ttt_memory,
+                )
+        else:
+            with torch.inference_mode():
+                pred = self.model([instruction], samples, states)
         if pred.dtype != self.model_dtype:
             raise RuntimeError(
                 f"precision={self.precision} expected forward output dtype {self.model_dtype}, got {pred.dtype}"

@@ -81,6 +81,9 @@ class GenerateConfig:
     fusion_dropout: float = 0.0
     fusion_droppath: float = 0.1
     sub_sentence_present: bool = True
+    enable_ttt: bool = False
+    ttt_inner_lr_init: float = 1e-2
+    ttt_gate_init: float = 1e-4
     precision: str = "bf16"
     dinov3_output_hidden_states: bool = True
 
@@ -237,6 +240,8 @@ def _run_episode(
     get_libero_dummy_action,
     rotate_libero_image,
 ) -> tuple[bool, list[np.ndarray], list[list[float]]]:
+    if hasattr(policy, "reset"):
+        policy.reset()
     env.reset()
     obs = env.set_init_state(initial_state)
     action_queue: deque[np.ndarray] = deque()
@@ -329,6 +334,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
         fusion_dropout=cfg.fusion_dropout,
         fusion_droppath=cfg.fusion_droppath,
         sub_sentence_present=cfg.sub_sentence_present,
+        enable_ttt=cfg.enable_ttt,
+        ttt_inner_lr_init=cfg.ttt_inner_lr_init,
+        ttt_gate_init=cfg.ttt_gate_init,
         precision=cfg.precision,
         dinov3_output_hidden_states=cfg.dinov3_output_hidden_states,
     )

@@ -14,7 +14,9 @@ from torch.utils.data import get_worker_info
 
 from .libero_rlds import (
     LiberoRLDSDataset as _BaseLiberoRLDSDataset,
+    LiberoSequenceRLDSDataset as _BaseLiberoSequenceRLDSDataset,
     vla_collate_fn,
+    vla_sequence_collate_fn,
 )
 from .suite_stats import (
     _select_stats,
@@ -149,4 +151,54 @@ class LiberoMixedRLDSDataset(_BaseLiberoRLDSDataset):
             epoch += 1
 
 
-__all__ = ["LiberoMixedRLDSDataset", "vla_collate_fn"]
+class LiberoMixedSequenceRLDSDataset(LiberoMixedRLDSDataset, _BaseLiberoSequenceRLDSDataset):
+    def __init__(
+        self,
+        *args,
+        context_length=8,
+        temporal_stride=12,
+        shuffle_sequence_starts=True,
+        **kwargs,
+    ):
+        kwargs["shuffle_steps_within_episode"] = False
+        kwargs["step_mix_buffer_size"] = 0
+        super().__init__(*args, **kwargs)
+        self.context_length = int(context_length)
+        self.temporal_stride = int(temporal_stride)
+        self.shuffle_sequence_starts = bool(shuffle_sequence_starts)
+        if self.context_length < 1:
+            raise ValueError("context_length must be positive")
+        if self.temporal_stride < 1:
+            raise ValueError("temporal_stride must be positive")
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+
+        base_seed = self.seed + 1009 * self.rank + 9176 * worker_id
+        epoch = 0
+        while True:
+            epoch_seed = base_seed + epoch
+            rng = np.random.default_rng(epoch_seed)
+
+            for episode in self._iter_mixed_episodes(epoch_seed, self.rank, self.world_size, worker_info):
+                steps = list(episode["steps"])
+                episode_len = len(steps)
+                span = 1 + (self.context_length - 1) * self.temporal_stride
+                if episode_len < span:
+                    continue
+                starts = list(range(0, episode_len - span + 1))
+                if self.shuffle_sequence_starts:
+                    rng.shuffle(starts)
+                for start in starts:
+                    yield self._build_sequence_sample(steps, start, episode_len)
+
+            epoch += 1
+
+
+__all__ = [
+    "LiberoMixedRLDSDataset",
+    "LiberoMixedSequenceRLDSDataset",
+    "vla_collate_fn",
+    "vla_sequence_collate_fn",
+]
