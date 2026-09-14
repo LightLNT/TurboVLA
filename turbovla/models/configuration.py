@@ -63,12 +63,22 @@ class ActionHeadConfig:
 
 
 @dataclass
+class TTTConfig:
+    enable_ttt: bool = False
+    position: str = "post_vl_fusion"
+    inner_lr_init: float = 1e-2
+    gate_init: float = 1e-4
+    tbptt_step_size: int | None = None
+
+
+@dataclass
 class TurboVLAConfig:
     name: str = "TurboVLA"
     text: TextEncoderConfig = field(default_factory=TextEncoderConfig)
     vision: VisionEncoderConfig = field(default_factory=VisionEncoderConfig)
     interaction: InteractionConfig = field(default_factory=InteractionConfig)
     action: ActionHeadConfig = field(default_factory=ActionHeadConfig)
+    ttt: TTTConfig = field(default_factory=TTTConfig)
 
     def __post_init__(self) -> None:
         if self.name != "TurboVLA":
@@ -101,6 +111,10 @@ class TurboVLAConfig:
             raise ValueError("interaction.compute_precision must be fp32 or bf16_autocast")
         if self.action.action_dim < 1 or self.action.state_dim < 1 or self.action.horizon < 1:
             raise ValueError("action dimensions and horizon must be positive")
+        if self.ttt.position != "post_vl_fusion":
+            raise ValueError("ttt.position must be 'post_vl_fusion'")
+        if self.ttt.inner_lr_init <= 0:
+            raise ValueError("ttt.inner_lr_init must be positive")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -114,4 +128,5 @@ class TurboVLAConfig:
             vision=VisionEncoderConfig(**dict(data.get("vision", {}))),
             interaction=InteractionConfig(**dict(data.get("interaction", {}))),
             action=ActionHeadConfig(**dict(data.get("action", {}))),
+            ttt=TTTConfig(**dict(data.get("ttt", {}))),
         )

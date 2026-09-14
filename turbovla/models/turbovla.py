@@ -13,11 +13,13 @@ from .components.utils import _get_clones
 from .configuration import (
     ActionHeadConfig,
     InteractionConfig,
+    TTTConfig,
     TextEncoderConfig,
     TurboVLAConfig,
     VisionEncoderConfig,
 )
 from .text_encoder import TurboVLATextEncoder
+from .ttt import TTTMemory, TemporalTTT
 from .vision_encoder import DINOv3VisionEncoder
 
 
@@ -128,6 +130,14 @@ class TurboVLA(nn.Module):
         nn.init.trunc_normal_(self.view_embedding, std=0.02)
 
         self.vision_language_interaction = VisionLanguageInteraction(config.interaction)
+        self.ttt = None
+        if config.ttt.enable_ttt:
+            self.ttt = TemporalTTT(
+                hidden_dim,
+                inner_lr_init=config.ttt.inner_lr_init,
+                gate_init=config.ttt.gate_init,
+                tbptt_step_size=config.ttt.tbptt_step_size,
+            )
         self.action_head = TurboVLAActionHead(
             config=config.action,
             hidden_dim=hidden_dim,
@@ -147,6 +157,13 @@ class TurboVLA(nn.Module):
         if pixel_values.ndim != 5:
             raise ValueError(f"samples must be [B,V,3,H,W] or [B,T,V,3,H,W], got {tuple(pixel_values.shape)}")
         return pixel_values
+
+    def _get_sample_tensor(self, samples: torch.Tensor | Mapping[str, torch.Tensor]) -> torch.Tensor:
+        if isinstance(samples, Mapping):
+            if "dinov3" not in samples:
+                raise ValueError("samples mapping must contain 'dinov3'")
+            return samples["dinov3"]
+        return samples
 
     def _position_visual_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         if self.config.vision.position_embedding == "learned_patch":
@@ -200,9 +217,73 @@ class TurboVLA(nn.Module):
         samples: torch.Tensor | Mapping[str, torch.Tensor],
         state: torch.Tensor,
     ) -> torch.Tensor:
+        pixel_values = self._get_sample_tensor(samples)
+        if pixel_values.ndim == 6 or state.ndim == 3:
+            return self.forward_sequence(instructions, samples, state)
         condition = self.encode_condition(instructions, samples)
+        if self.ttt is not None:
+            condition, _ = self.ttt.forward_step(condition)
         action_dtype = self.action_head.decoder.action_queries.weight.dtype
         return self.action_head(condition.to(dtype=action_dtype), state.to(dtype=action_dtype))
+
+    def _encode_condition_sequence(
+        self,
+        instructions: Sequence[str],
+        samples: torch.Tensor | Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, int, int]:
+        pixel_values = self._get_sample_tensor(samples)
+        if pixel_values.ndim != 6:
+            raise ValueError(f"sequence samples must be [B,T,V,3,H,W], got {tuple(pixel_values.shape)}")
+        batch_size, time = pixel_values.shape[:2]
+        if len(instructions) != batch_size:
+            raise ValueError("instruction batch size does not match sequence batch size")
+        flat_pixels = pixel_values.flatten(0, 1)
+        flat_instructions = [instruction for instruction in instructions for _ in range(time)]
+        condition = self.encode_condition(flat_instructions, {"dinov3": flat_pixels})
+        return condition.view(batch_size, time, condition.shape[1], condition.shape[2]), batch_size, time
+
+    def forward_sequence(
+        self,
+        instructions: Sequence[str],
+        samples: torch.Tensor | Mapping[str, torch.Tensor],
+        state: torch.Tensor,
+        prev_ttt_memory: TTTMemory | None = None,
+        return_ttt_memory: bool = False,
+    ):
+        condition, batch_size, time = self._encode_condition_sequence(instructions, samples)
+        next_ttt_memory = prev_ttt_memory
+        if self.ttt is not None:
+            condition, next_ttt_memory = self.ttt(condition, prev_memory=prev_ttt_memory)
+        if state.ndim != 3:
+            raise ValueError(f"sequence state must be [B,T,D], got {tuple(state.shape)}")
+        if state.shape[:2] != (batch_size, time):
+            raise ValueError(f"state sequence shape {tuple(state.shape[:2])} does not match {(batch_size, time)}")
+        action_dtype = self.action_head.decoder.action_queries.weight.dtype
+        flat_condition = condition.flatten(0, 1).to(dtype=action_dtype)
+        flat_state = state.flatten(0, 1).to(dtype=action_dtype)
+        actions = self.action_head(flat_condition, flat_state)
+        actions = actions.view(batch_size, time, actions.shape[1], actions.shape[2])
+        if return_ttt_memory:
+            return actions, next_ttt_memory
+        return actions
+
+    def forward_step(
+        self,
+        instructions: Sequence[str],
+        samples: torch.Tensor | Mapping[str, torch.Tensor],
+        state: torch.Tensor,
+        prev_ttt_memory: TTTMemory | None = None,
+        return_ttt_memory: bool = True,
+    ):
+        condition = self.encode_condition(instructions, samples)
+        next_ttt_memory = prev_ttt_memory
+        if self.ttt is not None:
+            condition, next_ttt_memory = self.ttt.forward_step(condition, prev_memory=prev_ttt_memory)
+        action_dtype = self.action_head.decoder.action_queries.weight.dtype
+        actions = self.action_head(condition.to(dtype=action_dtype), state.to(dtype=action_dtype))
+        if return_ttt_memory:
+            return actions, next_ttt_memory
+        return actions
 
     # Transitional read-only names used only by legacy checkpoint initialization.
     @property
@@ -288,6 +369,13 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 mlp_hidden_dim=int(_arg(args, "act_mlp_hidden_dim", 512)),
                 state_hidden_dim=int(_arg(args, "act_state_hidden_dim", 256)),
                 dropout=float(_arg(args, "act_dropout", 0.1)),
+            ),
+            ttt=TTTConfig(
+                enable_ttt=bool(_arg(args, "enable_ttt", False)),
+                position=str(_arg(args, "ttt_position", "post_vl_fusion")),
+                inner_lr_init=float(_arg(args, "ttt_inner_lr_init", 1e-2)),
+                gate_init=float(_arg(args, "ttt_gate_init", 1e-4)),
+                tbptt_step_size=_arg(args, "tbptt_step_size", None),
             ),
         )
     return TurboVLA(config)
