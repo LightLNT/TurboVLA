@@ -232,6 +232,86 @@ class LiberoRLDSDataset(IterableDataset):
             epoch += 1
 
 
+class LiberoSequenceRLDSDataset(LiberoRLDSDataset):
+    def __init__(
+        self,
+        *args,
+        context_length=8,
+        temporal_stride=12,
+        shuffle_sequence_starts=True,
+        **kwargs,
+    ):
+        kwargs["shuffle_steps_within_episode"] = False
+        kwargs["step_mix_buffer_size"] = 0
+        super().__init__(*args, **kwargs)
+        self.context_length = int(context_length)
+        self.temporal_stride = int(temporal_stride)
+        self.shuffle_sequence_starts = bool(shuffle_sequence_starts)
+        if self.context_length < 1:
+            raise ValueError("context_length must be positive")
+        if self.temporal_stride < 1:
+            raise ValueError("temporal_stride must be positive")
+
+    def _build_sequence_sample(self, steps, start, episode_len):
+        indices = [start + idx * self.temporal_stride for idx in range(self.context_length)]
+        samples = [self._build_step_sample(steps, t, episode_len) for t in indices]
+
+        images = []
+        states = []
+        action_chunks = []
+        action_chunk_masks = []
+        instruction = samples[0][1]
+        for step_images, step_instruction, state, action_chunk, action_chunk_mask in samples:
+            if step_instruction != instruction:
+                raise ValueError("sequence sample contains changing instruction text")
+            images.append(step_images)
+            states.append(state)
+            action_chunks.append(action_chunk)
+            action_chunk_masks.append(action_chunk_mask)
+
+        return images, instruction, torch.stack(states), torch.stack(action_chunks), torch.stack(action_chunk_masks)
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+
+        base_seed = self.seed + 1009 * self.rank + 9176 * worker_id
+        builder = tfds.builder_from_directory(builder_dir=self.dataset_dir)
+
+        epoch = 0
+        while True:
+            epoch_seed = base_seed + epoch
+            rng = np.random.default_rng(epoch_seed)
+
+            dataset = builder.as_dataset(split=self.split)
+
+            if self.world_size > 1:
+                dataset = dataset.shard(num_shards=self.world_size, index=self.rank)
+
+            if worker_info is not None:
+                dataset = dataset.shard(num_shards=worker_info.num_workers, index=worker_info.id)
+
+            dataset = dataset.shuffle(
+                buffer_size=self.shuffle_buffer,
+                seed=epoch_seed,
+                reshuffle_each_iteration=False,
+            )
+
+            for episode in tfds.as_numpy(dataset):
+                steps = list(episode["steps"])
+                episode_len = len(steps)
+                span = 1 + (self.context_length - 1) * self.temporal_stride
+                if episode_len < span:
+                    continue
+                starts = list(range(0, episode_len - span + 1))
+                if self.shuffle_sequence_starts:
+                    rng.shuffle(starts)
+                for start in starts:
+                    yield self._build_sequence_sample(steps, start, episode_len)
+
+            epoch += 1
+
+
 def vla_collate_fn(batch):
     if len(batch) == 0:
         raise ValueError("empty batch cannot be collated")
@@ -266,5 +346,38 @@ def vla_collate_fn(batch):
     action_chunks = torch.stack(action_chunks, dim=0)
     action_chunk_masks = torch.stack(action_chunk_masks, dim=0)
     states = torch.stack(states, dim=0)
+
+    return samples, instructions, states, action_chunks, action_chunk_masks
+
+
+def vla_sequence_collate_fn(batch):
+    if len(batch) == 0:
+        raise ValueError("empty batch cannot be collated")
+
+    sequence_images = []
+    instructions = []
+    action_chunks = []
+    action_chunk_masks = []
+    states = []
+
+    for images, instruction, state, action_chunk, action_chunk_mask in batch:
+        dino_views = []
+        for step_images in images:
+            if not isinstance(step_images, (list, tuple)) or len(step_images) != 2:
+                raise ValueError("Each sequence step must contain two camera views: (img1, img2)")
+            img1, img2 = step_images
+            if "dinov3" not in img1 or "dinov3" not in img2:
+                raise ValueError("Each view must contain preprocessed tensor for key 'dinov3'")
+            dino_views.append(torch.stack([img1["dinov3"], img2["dinov3"]], dim=0))
+        sequence_images.append(torch.stack(dino_views, dim=0))
+        instructions.append(instruction)
+        states.append(state)
+        action_chunks.append(action_chunk)
+        action_chunk_masks.append(action_chunk_mask)
+
+    samples = {"dinov3": torch.stack(sequence_images, dim=0)}
+    states = torch.stack(states, dim=0)
+    action_chunks = torch.stack(action_chunks, dim=0)
+    action_chunk_masks = torch.stack(action_chunk_masks, dim=0)
 
     return samples, instructions, states, action_chunks, action_chunk_masks
